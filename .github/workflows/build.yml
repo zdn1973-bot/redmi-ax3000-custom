@@ -8,201 +8,46 @@ permissions:
 
 env:
   RELEASE_TAG: ci-ipq50xx-mainline-kernel-5.15-openwrt-23.05-20260509-161528-UTC
-  MIHOMO_VERSION: v1.19.30
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install host tools
-        shell: bash
-        run: |
-          set -e
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            git \
-            wget \
-            curl \
-            tar \
-            gzip \
-            xz-utils \
-            unzip \
-            file \
-            python3
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y wget tar xz-utils
 
       - name: Download ImageBuilder
-        shell: bash
         run: |
           set -e
+          wget -O imagebuilder.tar.xz "https://github.com/Labradors/openwrt-redmi-ax3000/releases/download/${RELEASE_TAG}/openwrt-imagebuilder-ipq50xx-arm.Linux-x86_64.tar.xz"
+          mkdir imagebuilder
+          tar -xJf imagebuilder.tar.xz -C imagebuilder --strip-components=1
 
-          wget -O imagebuilder.tar.xz \
-            "https://github.com/Labradors/openwrt-redmi-ax3000/releases/download/${RELEASE_TAG}/openwrt-imagebuilder-ipq50xx-arm.Linux-x86_64.tar.xz"
-
-          mkdir -p imagebuilder
-
-          tar -xJf imagebuilder.tar.xz \
-            -C imagebuilder \
-            --strip-components=1
-
-          echo "===== repositories.conf BEFORE ====="
-          cat imagebuilder/repositories.conf || true
-
-          echo "===== Removing broken ImmortalWrt feed ====="
-          sed -i \
-            '/^[[:space:]]*src\/gz[[:space:]]\+immortalwrt_packages[[:space:]]/d' \
-            imagebuilder/repositories.conf
-
-          echo "===== Adding ImmortalWrt feed ====="
-          cat >> imagebuilder/repositories.conf <<'EOF'
-src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/23.05.3/packages/arm_cortex-a7_neon-vfpv4/base
-EOF
-
-          echo "===== repositories.conf AFTER ====="
+      - name: Fix repositories
+        run: |
+          set -e
+          sed -i '/immortalwrt_packages/d' imagebuilder/repositories.conf
+          echo 'src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/23.05.3/packages/arm_cortex-a7_neon-vfpv4/base' >> imagebuilder/repositories.conf
           cat imagebuilder/repositories.conf
 
-      - name: Prepare custom files
-        shell: bash
-        run: |
-          set -e
-
-          mkdir -p files/usr/local/bin
-          mkdir -p files/etc/clash.meta
-          mkdir -p files/etc/uci-defaults
-
-      - name: Download Mihomo
-        shell: bash
-        run: |
-          set -e
-
-          MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-armv7-${MIHOMO_VERSION}.gz"
-
-          echo "Downloading Mihomo:"
-          echo "${MIHOMO_URL}"
-
-          wget -O /tmp/mihomo.gz "${MIHOMO_URL}"
-
-          echo "===== Mihomo archive ====="
-          ls -lh /tmp/mihomo.gz
-
-          gzip -dc /tmp/mihomo.gz > files/usr/local/bin/mihomo
-          chmod 0755 files/usr/local/bin/mihomo
-
-          echo "===== Mihomo binary ====="
-          file files/usr/local/bin/mihomo
-          ls -lh files/usr/local/bin/mihomo
-
-      - name: Verify Mihomo
-        shell: bash
-        run: |
-          set -e
-
-          files/usr/local/bin/mihomo -v
-
-      - name: Create minimal Mihomo config
-        shell: bash
-        run: |
-          set -e
-
-          cat > files/etc/clash.meta/config.yaml <<'EOF'
-          mixed-port: 7890
-          tproxy-port: 12345
-
-          allow-lan: true
-          bind-address: "*"
-
-          mode: rule
-          log-level: warning
-
-          ipv6: false
-
-          dns:
-            enable: true
-            ipv6: false
-            listen: 0.0.0.0:1053
-
-          proxies:
-            - name: DIRECT
-              type: direct
-
-          proxy-groups:
-            - name: PROXY
-              type: select
-              proxies:
-                - DIRECT
-
-          rules:
-            - MATCH,PROXY
-          EOF
-
-          echo "===== Mihomo config ====="
-          cat files/etc/clash.meta/config.yaml
-
-      - name: Enable ZRAM on first boot
-        shell: bash
-        run: |
-          set -e
-
-          cat > files/etc/uci-defaults/99-zram-custom <<'EOF'
-          #!/bin/sh
-
-          if [ -x /etc/init.d/zram ]; then
-              /etc/init.d/zram enable
-          fi
-
-          exit 0
-          EOF
-
-          chmod 0755 files/etc/uci-defaults/99-zram-custom
-
-      - name: Verify package repositories
-        shell: bash
-        run: |
-          set -e
-
-          cd imagebuilder
-
-          echo "===== repositories.conf ====="
-          cat repositories.conf
-
-          echo "===== ImageBuilder profile ====="
-          make info V=s
-
       - name: Build firmware
-        shell: bash
         run: |
           set -e
-
           cd imagebuilder
+          make image PROFILE="redmi_ax3000" PACKAGES="zram-swap kmod-zram kmod-nft-tproxy kmod-nft-socket ip-full nftables luci-base" V=s
 
-          make image \
-            PROFILE="redmi_ax3000" \
-            PACKAGES="zram-swap kmod-zram kmod-nft-tproxy kmod-nft-socket ip-full nftables luci-base" \
-            FILES="../files" \
-            V=s
-
-      - name: List build output
+      - name: Show output
         if: always()
-        shell: bash
         run: |
-          echo "===== Build output ====="
-          find imagebuilder/bin/targets/ipq50xx/arm \
-            -maxdepth 2 \
-            -type f \
-            -print \
-            2>/dev/null | sort || true
+          find imagebuilder/bin/targets -type f -print || true
 
       - name: Upload firmware
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: redmi-ax3000-custom-firmware
-          if-no-files-found: error
-          path: |
-            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*squashfs-nand-factory.ubi
-            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*initramfs*.itb
-            imagebuilder/bin/targets/ipq50xx/arm/*.manifest
+          name: redmi-ax3000-firmware
+          path: imagebuilder/bin/targets/**
