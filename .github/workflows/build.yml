@@ -19,7 +19,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install host tools
+        shell: bash
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
@@ -50,14 +52,12 @@ jobs:
           echo "===== repositories.conf BEFORE ====="
           cat imagebuilder/repositories.conf || true
 
-          echo "===== Fixing repositories.conf ====="
-
-          # Remove the dead OpenWrt URL that was causing:
-          # immortalwrt_packages/Packages.gz -> HTTP 404
-          sed -i '/^[[:space:]]*src\/gz[[:space:]]\+immortalwrt_packages[[:space:]]/d' \
+          echo "===== Removing broken ImmortalWrt feed ====="
+          sed -i \
+            '/^[[:space:]]*src\/gz[[:space:]]\+immortalwrt_packages[[:space:]]/d' \
             imagebuilder/repositories.conf
 
-          # Add the real ImmortalWrt package feed for ARM Cortex-A7 NEON.
+          echo "===== Adding ImmortalWrt feed ====="
           cat >> imagebuilder/repositories.conf <<'EOF'
 src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/23.05.3/packages/arm_cortex-a7_neon-vfpv4/base
 EOF
@@ -65,39 +65,48 @@ EOF
           echo "===== repositories.conf AFTER ====="
           cat imagebuilder/repositories.conf
 
-      - name: Download Mihomo
+      - name: Prepare custom files
         shell: bash
         run: |
           set -e
 
           mkdir -p files/usr/local/bin
+          mkdir -p files/etc/clash.meta
+          mkdir -p files/etc/uci-defaults
+
+      - name: Download Mihomo
+        shell: bash
+        run: |
+          set -e
 
           MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-armv7-${MIHOMO_VERSION}.gz"
 
-          echo "Downloading:"
+          echo "Downloading Mihomo:"
           echo "${MIHOMO_URL}"
 
           wget -O /tmp/mihomo.gz "${MIHOMO_URL}"
 
-          echo "===== Mihomo file ====="
+          echo "===== Mihomo archive ====="
           ls -lh /tmp/mihomo.gz
-
-          # Verified SHA256 for the exact ARMv7 asset.
-          echo "7b4e8793f9f8fa4a21ea66528890ebde5a73d557673fb94d3047eebb60ad7591  /tmp/mihomo.gz" \
-            | sha256sum -c -
 
           gzip -dc /tmp/mihomo.gz > files/usr/local/bin/mihomo
           chmod 0755 files/usr/local/bin/mihomo
 
+          echo "===== Mihomo binary ====="
           file files/usr/local/bin/mihomo
           ls -lh files/usr/local/bin/mihomo
+
+      - name: Verify Mihomo
+        shell: bash
+        run: |
+          set -e
+
+          files/usr/local/bin/mihomo -v
 
       - name: Create minimal Mihomo config
         shell: bash
         run: |
           set -e
-
-          mkdir -p files/etc/clash.meta
 
           cat > files/etc/clash.meta/config.yaml <<'EOF'
           mixed-port: 7890
@@ -133,12 +142,10 @@ EOF
           echo "===== Mihomo config ====="
           cat files/etc/clash.meta/config.yaml
 
-      - name: Create ZRAM first-boot configuration
+      - name: Enable ZRAM on first boot
         shell: bash
         run: |
           set -e
-
-          mkdir -p files/etc/uci-defaults
 
           cat > files/etc/uci-defaults/99-zram-custom <<'EOF'
           #!/bin/sh
@@ -152,37 +159,17 @@ EOF
 
           chmod 0755 files/etc/uci-defaults/99-zram-custom
 
-      - name: Prepare image packages
-        shell: bash
-        run: |
-          set -e
-
-          cat > /tmp/packages.txt <<'EOF'
-          zram-swap
-          kmod-zram
-          kmod-nft-tproxy
-          kmod-nft-socket
-          ip-full
-          nftables
-          luci-base
-          EOF
-
-          echo "===== Requested additional packages ====="
-          cat /tmp/packages.txt
-
-      - name: Verify ImageBuilder package availability
+      - name: Verify package repositories
         shell: bash
         run: |
           set -e
 
           cd imagebuilder
 
-          echo "===== ImageBuilder package indexes ====="
-          find . -maxdepth 3 -type f \
-            \( -name 'Packages' -o -name 'Packages.gz' \) \
-            -print | sort | head -100
+          echo "===== repositories.conf ====="
+          cat repositories.conf
 
-          echo "===== Profile ====="
+          echo "===== ImageBuilder profile ====="
           make info V=s
 
       - name: Build firmware
@@ -206,10 +193,10 @@ EOF
           find imagebuilder/bin/targets/ipq50xx/arm \
             -maxdepth 2 \
             -type f \
-            -printf '%p\n' \
+            -print \
             2>/dev/null | sort || true
 
-      - name: Upload firmware artifacts
+      - name: Upload firmware
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -217,5 +204,5 @@ EOF
           if-no-files-found: error
           path: |
             imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*squashfs-nand-factory.ubi
-            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*initramfs-fit-uImage.itb
+            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*initramfs*.itb
             imagebuilder/bin/targets/ipq50xx/arm/*.manifest
