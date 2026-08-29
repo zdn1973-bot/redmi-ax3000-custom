@@ -18,10 +18,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install host tools
+        shell: bash
         run: |
+          set -e
+
           sudo apt-get update
-          sudo apt-get install -y wget tar xz-utils gzip git file
+
+          sudo apt-get install -y \
+            wget \
+            curl \
+            tar \
+            xz-utils \
+            gzip \
+            git \
+            file \
+            binutils \
+            python3
 
       - name: Download ImageBuilder
         shell: bash
@@ -37,62 +50,185 @@ jobs:
             -C imagebuilder \
             --strip-components=1
 
-          echo "===== ImageBuilder repositories ====="
+          echo "===== ImageBuilder ====="
+          ls -lah imagebuilder
+
+          echo "===== repositories.conf BEFORE ====="
           cat imagebuilder/repositories.conf
 
-      - name: Fix package feeds
+      - name: Fix ImageBuilder feeds
         shell: bash
         run: |
           set -e
 
           cd imagebuilder
 
-          # Remove the invalid feed from the ImageBuilder.
           sed -i '/immortalwrt_packages/d' repositories.conf
 
-          # Use the published ImmortalWrt 23.05.3 ARMv7 package tree.
           echo 'src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/23.05.3/packages/arm_cortex-a7_neon-vfpv4/base' >> repositories.conf
 
-          echo "===== Fixed repositories ====="
+          echo "===== repositories.conf AFTER ====="
           cat repositories.conf
 
-      - name: Download Mihomo ARMv7
+      - name: Prepare custom filesystem
         shell: bash
         run: |
           set -e
 
           mkdir -p files/usr/local/bin
+          mkdir -p files/etc/clash.meta
+          mkdir -p files/etc/uci-defaults
 
-          URL="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-armv7-${MIHOMO_VERSION}.gz"
+      - name: Download Mihomo Linux ARMv7
+        shell: bash
+        run: |
+          set -e
 
-          wget -O /tmp/mihomo.gz "$URL"
+          echo "Getting Mihomo release metadata..."
+
+          curl -fsSL \
+            "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${MIHOMO_VERSION}" \
+            -o /tmp/mihomo-release.json
+
+          MIHOMO_URL="$(python3 -c '
+          import json, sys
+
+          with open("/tmp/mihomo-release.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          assets = data.get("assets", [])
+
+          candidates = []
+
+          for asset in assets:
+              name = asset.get("name", "")
+              url = asset.get("browser_download_url", "")
+
+              if "linux-armv7" in name.lower() and name.lower().endswith(".gz"):
+                  candidates.append((name, url))
+
+          if not candidates:
+              print("ERROR: Linux ARMv7 Mihomo asset was not found.", file=sys.stderr)
+              print("Available assets:", file=sys.stderr)
+              for asset in assets:
+                  print(asset.get("name", ""), file=sys.stderr)
+              sys.exit(1)
+
+          candidates.sort(key=lambda x: x[0])
+
+          print(candidates[-1][1])
+          ')"
+
+          echo "===== Selected Mihomo URL ====="
+          echo "${MIHOMO_URL}"
+
+          wget -O /tmp/mihomo.gz "${MIHOMO_URL}"
+
+          echo "===== Download ====="
+          ls -lh /tmp/mihomo.gz
 
           gzip -dc /tmp/mihomo.gz > files/usr/local/bin/mihomo
 
           chmod 0755 files/usr/local/bin/mihomo
 
-          echo "===== Mihomo ====="
+          echo "===== Mihomo ELF information ====="
           file files/usr/local/bin/mihomo
-          ls -lh files/usr/local/bin/mihomo
 
-      - name: Verify Mihomo
-        shell: bash
-        run: |
-          set -e
-          files/usr/local/bin/mihomo -v
+          readelf -h files/usr/local/bin/mihomo | \
+            grep -E 'Class:|Data:|Machine:'
 
-      - name: Create Mihomo directory
-        shell: bash
-        run: |
-          set -e
-          mkdir -p files/etc/clash.meta
-
-      - name: Create first boot configuration
+      - name: Validate Mihomo architecture
         shell: bash
         run: |
           set -e
 
-          mkdir -p files/etc/uci-defaults
+          echo "Checking ELF architecture..."
+
+          file files/usr/local/bin/mihomo
+
+          MACHINE="$(readelf -h files/usr/local/bin/mihomo | awk -F: '/Machine:/ {gsub(/^[ \t]+/, "", $2); print $2}')"
+
+          echo "Detected machine: ${MACHINE}"
+
+          case "${MACHINE}" in
+            ARM*)
+              echo "Mihomo ARM binary detected."
+              ;;
+            *)
+              echo "ERROR: Mihomo binary is not ARM."
+              exit 1
+              ;;
+          esac
+
+      - name: Install TProxy LuCI files
+        shell: bash
+        run: |
+          set -e
+
+          git clone \
+            --depth 1 \
+            https://github.com/SmartRouterZone/luci-app-tproxy.git \
+            tproxy
+
+          echo "===== TProxy repository ====="
+          find tproxy -maxdepth 3 -type f | sort
+
+          # OpenWrt package root files.
+          if [ -d tproxy/root ]; then
+            cp -a tproxy/root/. files/
+          fi
+
+          # LuCI static files belong under /www/.
+          if [ -d tproxy/htdocs ]; then
+            mkdir -p files/www
+            cp -a tproxy/htdocs/. files/www/
+          fi
+
+          echo "===== Installed TProxy files ====="
+          find files -type f | sort
+
+      - name: Create Mihomo default config
+        shell: bash
+        run: |
+          set -e
+
+          printf '%s\n' \
+            'mixed-port: 7890' \
+            'tproxy-port: 12345' \
+            '' \
+            'allow-lan: true' \
+            'bind-address: "*"' \
+            '' \
+            'mode: rule' \
+            'log-level: warning' \
+            'ipv6: false' \
+            '' \
+            'dns:' \
+            '  enable: true' \
+            '  ipv6: false' \
+            '  listen: 0.0.0.0:1053' \
+            '' \
+            'proxies:' \
+            '  - name: DIRECT' \
+            '    type: direct' \
+            '' \
+            'proxy-groups:' \
+            '  - name: PROXY' \
+            '    type: select' \
+            '    proxies:' \
+            '      - DIRECT' \
+            '' \
+            'rules:' \
+            '  - MATCH,PROXY' \
+            > files/etc/clash.meta/config.yaml
+
+          echo "===== Mihomo config ====="
+          cat files/etc/clash.meta/config.yaml
+
+      - name: Enable ZRAM on first boot
+        shell: bash
+        run: |
+          set -e
 
           printf '%s\n' \
             '#!/bin/sh' \
@@ -106,6 +242,31 @@ jobs:
 
           chmod 0755 files/etc/uci-defaults/99-zram-custom
 
+      - name: Show requested package set
+        shell: bash
+        run: |
+          set -e
+
+          echo "===== Additional packages ====="
+
+          printf '%s\n' \
+            'zram-swap' \
+            'kmod-zram' \
+            'kmod-nft-tproxy' \
+            'kmod-nft-socket' \
+            'ip-full' \
+            'nftables' \
+            'luci-base'
+
+      - name: Show ImageBuilder profile
+        shell: bash
+        run: |
+          set -e
+
+          cd imagebuilder
+
+          make info V=s
+
       - name: Build firmware
         shell: bash
         run: |
@@ -115,20 +276,32 @@ jobs:
 
           make image \
             PROFILE="redmi_ax3000" \
-            PACKAGES="-ath11k-firmware-ipq5018 -ath11k-firmware-qcn6122 ath11k-firmware-ipq5018-qcn6122 zram-swap kmod-zram kmod-nft-tproxy kmod-nft-socket ip-full nftables luci-base" \
+            PACKAGES="-ath11k-firmware-ipq5018 -ath11k-firmware-qcn6122 zram-swap kmod-zram kmod-nft-tproxy kmod-nft-socket ip-full nftables luci-base" \
             FILES="../files" \
             V=s
 
-      - name: Show generated files
+      - name: List firmware output
         if: always()
         shell: bash
         run: |
-          echo "===== Firmware output ====="
+          echo "===== Generated files ====="
+
           find imagebuilder/bin/targets \
             -type f \
-            -maxdepth 4 \
             -print \
             2>/dev/null | sort || true
+
+      - name: Show firmware sizes
+        if: always()
+        shell: bash
+        run: |
+          echo "===== File sizes ====="
+
+          find imagebuilder/bin/targets \
+            -type f \
+            -printf '%s %p\n' \
+            2>/dev/null \
+            | sort -n || true
 
       - name: Upload firmware
         if: success()
