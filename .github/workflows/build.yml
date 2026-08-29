@@ -8,6 +8,7 @@ permissions:
 
 env:
   RELEASE_TAG: ci-ipq50xx-mainline-kernel-5.15-openwrt-23.05-20260509-161528-UTC
+  MIHOMO_VERSION: v1.19.30
 
 jobs:
   build:
@@ -18,36 +19,122 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y wget tar xz-utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget tar xz-utils gzip git file
 
       - name: Download ImageBuilder
+        shell: bash
         run: |
           set -e
-          wget -O imagebuilder.tar.xz "https://github.com/Labradors/openwrt-redmi-ax3000/releases/download/${RELEASE_TAG}/openwrt-imagebuilder-ipq50xx-arm.Linux-x86_64.tar.xz"
-          mkdir imagebuilder
-          tar -xJf imagebuilder.tar.xz -C imagebuilder --strip-components=1
 
-      - name: Fix repositories
-        run: |
-          set -e
-          sed -i '/immortalwrt_packages/d' imagebuilder/repositories.conf
-          echo 'src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/23.05.3/packages/arm_cortex-a7_neon-vfpv4/base' >> imagebuilder/repositories.conf
+          wget -O imagebuilder.tar.xz \
+            "https://github.com/Labradors/openwrt-redmi-ax3000/releases/download/${RELEASE_TAG}/openwrt-imagebuilder-ipq50xx-arm.Linux-x86_64.tar.xz"
+
+          mkdir -p imagebuilder
+
+          tar -xJf imagebuilder.tar.xz \
+            -C imagebuilder \
+            --strip-components=1
+
+          echo "===== ImageBuilder repositories ====="
           cat imagebuilder/repositories.conf
 
-      - name: Build firmware
+      - name: Fix package feeds
+        shell: bash
         run: |
           set -e
-          cd imagebuilder
-          make image PROFILE="redmi_ax3000" PACKAGES="zram-swap kmod-zram kmod-nft-tproxy kmod-nft-socket ip-full nftables luci-base" V=s
 
-      - name: Show output
-        if: always()
+          cd imagebuilder
+
+          # Remove the invalid feed from the ImageBuilder.
+          sed -i '/immortalwrt_packages/d' repositories.conf
+
+          # Use the published ImmortalWrt 23.05.3 ARMv7 package tree.
+          echo 'src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/23.05.3/packages/arm_cortex-a7_neon-vfpv4/base' >> repositories.conf
+
+          echo "===== Fixed repositories ====="
+          cat repositories.conf
+
+      - name: Download Mihomo ARMv7
+        shell: bash
         run: |
-          find imagebuilder/bin/targets -type f -print || true
+          set -e
+
+          mkdir -p files/usr/local/bin
+
+          URL="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-armv7-${MIHOMO_VERSION}.gz"
+
+          wget -O /tmp/mihomo.gz "$URL"
+
+          gzip -dc /tmp/mihomo.gz > files/usr/local/bin/mihomo
+
+          chmod 0755 files/usr/local/bin/mihomo
+
+          echo "===== Mihomo ====="
+          file files/usr/local/bin/mihomo
+          ls -lh files/usr/local/bin/mihomo
+
+      - name: Verify Mihomo
+        shell: bash
+        run: |
+          set -e
+          files/usr/local/bin/mihomo -v
+
+      - name: Create Mihomo directory
+        shell: bash
+        run: |
+          set -e
+          mkdir -p files/etc/clash.meta
+
+      - name: Create first boot configuration
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p files/etc/uci-defaults
+
+          printf '%s\n' \
+            '#!/bin/sh' \
+            '' \
+            'if [ -x /etc/init.d/zram ]; then' \
+            '    /etc/init.d/zram enable' \
+            'fi' \
+            '' \
+            'exit 0' \
+            > files/etc/uci-defaults/99-zram-custom
+
+          chmod 0755 files/etc/uci-defaults/99-zram-custom
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          set -e
+
+          cd imagebuilder
+
+          make image \
+            PROFILE="redmi_ax3000" \
+            PACKAGES="-ath11k-firmware-ipq5018 -ath11k-firmware-qcn6122 ath11k-firmware-ipq5018-qcn6122 zram-swap kmod-zram kmod-nft-tproxy kmod-nft-socket ip-full nftables luci-base" \
+            FILES="../files" \
+            V=s
+
+      - name: Show generated files
+        if: always()
+        shell: bash
+        run: |
+          echo "===== Firmware output ====="
+          find imagebuilder/bin/targets \
+            -type f \
+            -maxdepth 4 \
+            -print \
+            2>/dev/null | sort || true
 
       - name: Upload firmware
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: redmi-ax3000-firmware
-          path: imagebuilder/bin/targets/**
+          name: redmi-ax3000-custom-firmware
+          if-no-files-found: error
+          path: |
+            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*
