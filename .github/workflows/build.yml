@@ -18,7 +18,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install build tools
+      - name: Install host tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -30,51 +30,86 @@ jobs:
             gzip \
             xz-utils \
             unzip \
-            file
+            file \
+            python3
 
-      - name: Download OpenWrt ImageBuilder
+      - name: Download ImageBuilder
+        shell: bash
         run: |
+          set -e
+
           wget -O imagebuilder.tar.xz \
             "https://github.com/Labradors/openwrt-redmi-ax3000/releases/download/${RELEASE_TAG}/openwrt-imagebuilder-ipq50xx-arm.Linux-x86_64.tar.xz"
 
-          mkdir imagebuilder
-          tar -xJf imagebuilder.tar.xz -C imagebuilder --strip-components=1
+          mkdir -p imagebuilder
 
-      - name: Prepare custom files
+          tar -xJf imagebuilder.tar.xz \
+            -C imagebuilder \
+            --strip-components=1
+
+          echo "===== repositories.conf BEFORE ====="
+          cat imagebuilder/repositories.conf || true
+
+          echo "===== Fixing repositories.conf ====="
+
+          # Remove the dead OpenWrt URL that was causing:
+          # immortalwrt_packages/Packages.gz -> HTTP 404
+          sed -i '/^[[:space:]]*src\/gz[[:space:]]\+immortalwrt_packages[[:space:]]/d' \
+            imagebuilder/repositories.conf
+
+          # Add the real ImmortalWrt package feed for ARM Cortex-A7 NEON.
+          cat >> imagebuilder/repositories.conf <<'EOF'
+src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/23.05.3/packages/arm_cortex-a7_neon-vfpv4/base
+EOF
+
+          echo "===== repositories.conf AFTER ====="
+          cat imagebuilder/repositories.conf
+
+      - name: Download Mihomo
+        shell: bash
         run: |
-          mkdir -p files
+          set -e
 
-          # Download luci-app-tproxy source
-          git clone --depth 1 \
-            https://github.com/SmartRouterZone/luci-app-tproxy.git \
-            tproxy
-
-          # Install the LuCI/TProxy files directly into the firmware.
-          cp -a tproxy/root/. files/
-          cp -a tproxy/htdocs/. files/
-
-          # Mihomo ARMv7
           mkdir -p files/usr/local/bin
-          wget -O mihomo.gz \
-            "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-armv7-${MIHOMO_VERSION}.gz"
 
-          echo "7b4e8793f9f8fa4a21ea66528890ebde5a73d557673fb94d3047eebb60ad7591  mihomo.gz" | sha256sum -c -
+          MIHOMO_URL="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-armv7-${MIHOMO_VERSION}.gz"
 
-          gzip -dc mihomo.gz > files/usr/local/bin/mihomo
-          chmod 755 files/usr/local/bin/mihomo
+          echo "Downloading:"
+          echo "${MIHOMO_URL}"
 
-          # Create the default Mihomo directory.
+          wget -O /tmp/mihomo.gz "${MIHOMO_URL}"
+
+          echo "===== Mihomo file ====="
+          ls -lh /tmp/mihomo.gz
+
+          # Verified SHA256 for the exact ARMv7 asset.
+          echo "7b4e8793f9f8fa4a21ea66528890ebde5a73d557673fb94d3047eebb60ad7591  /tmp/mihomo.gz" \
+            | sha256sum -c -
+
+          gzip -dc /tmp/mihomo.gz > files/usr/local/bin/mihomo
+          chmod 0755 files/usr/local/bin/mihomo
+
+          file files/usr/local/bin/mihomo
+          ls -lh files/usr/local/bin/mihomo
+
+      - name: Create minimal Mihomo config
+        shell: bash
+        run: |
+          set -e
+
           mkdir -p files/etc/clash.meta
 
-          # Safe initial configuration.
           cat > files/etc/clash.meta/config.yaml <<'EOF'
           mixed-port: 7890
           tproxy-port: 12345
-          mode: rule
-          log-level: warning
 
           allow-lan: true
           bind-address: "*"
+
+          mode: rule
+          log-level: warning
+
+          ipv6: false
 
           dns:
             enable: true
@@ -95,8 +130,14 @@ jobs:
             - MATCH,PROXY
           EOF
 
-      - name: Configure ZRAM
+          echo "===== Mihomo config ====="
+          cat files/etc/clash.meta/config.yaml
+
+      - name: Create ZRAM first-boot configuration
+        shell: bash
         run: |
+          set -e
+
           mkdir -p files/etc/uci-defaults
 
           cat > files/etc/uci-defaults/99-zram-custom <<'EOF'
@@ -109,10 +150,46 @@ jobs:
           exit 0
           EOF
 
-          chmod 755 files/etc/uci-defaults/99-zram-custom
+          chmod 0755 files/etc/uci-defaults/99-zram-custom
+
+      - name: Prepare image packages
+        shell: bash
+        run: |
+          set -e
+
+          cat > /tmp/packages.txt <<'EOF'
+          zram-swap
+          kmod-zram
+          kmod-nft-tproxy
+          kmod-nft-socket
+          ip-full
+          nftables
+          luci-base
+          EOF
+
+          echo "===== Requested additional packages ====="
+          cat /tmp/packages.txt
+
+      - name: Verify ImageBuilder package availability
+        shell: bash
+        run: |
+          set -e
+
+          cd imagebuilder
+
+          echo "===== ImageBuilder package indexes ====="
+          find . -maxdepth 3 -type f \
+            \( -name 'Packages' -o -name 'Packages.gz' \) \
+            -print | sort | head -100
+
+          echo "===== Profile ====="
+          make info V=s
 
       - name: Build firmware
+        shell: bash
         run: |
+          set -e
+
           cd imagebuilder
 
           make image \
@@ -121,15 +198,24 @@ jobs:
             FILES="../files" \
             V=s
 
-      - name: Find firmware
+      - name: List build output
+        if: always()
+        shell: bash
         run: |
-          find imagebuilder/bin/targets/ipq50xx/arm -type f -maxdepth 2 -print
+          echo "===== Build output ====="
+          find imagebuilder/bin/targets/ipq50xx/arm \
+            -maxdepth 2 \
+            -type f \
+            -printf '%p\n' \
+            2>/dev/null | sort || true
 
-      - name: Upload firmware
+      - name: Upload firmware artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: redmi-ax3000-custom-firmware
+          if-no-files-found: error
           path: |
-            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*factory.ubi
-            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*initramfs*.itb
+            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*squashfs-nand-factory.ubi
+            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*initramfs-fit-uImage.itb
             imagebuilder/bin/targets/ipq50xx/arm/*.manifest
