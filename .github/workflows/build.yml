@@ -70,7 +70,7 @@ jobs:
           echo "===== repositories.conf AFTER ====="
           cat repositories.conf
 
-      - name: Prepare custom filesystem
+      - name: Prepare filesystem
         shell: bash
         run: |
           set -e
@@ -79,28 +79,25 @@ jobs:
           mkdir -p files/etc/clash.meta
           mkdir -p files/etc/uci-defaults
 
-      - name: Download Mihomo Linux ARMv7
+      - name: Download Mihomo ARMv7
         shell: bash
         run: |
           set -e
-
-          echo "Getting Mihomo release metadata..."
 
           curl -fsSL \
             "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${MIHOMO_VERSION}" \
             -o /tmp/mihomo-release.json
 
           MIHOMO_URL="$(python3 -c '
-          import json, sys
+          import json
+          import sys
 
           with open("/tmp/mihomo-release.json", "r", encoding="utf-8") as f:
               data = json.load(f)
 
-          assets = data.get("assets", [])
-
           candidates = []
 
-          for asset in assets:
+          for asset in data.get("assets", []):
               name = asset.get("name", "")
               url = asset.get("browser_download_url", "")
 
@@ -108,10 +105,11 @@ jobs:
                   candidates.append((name, url))
 
           if not candidates:
-              print("ERROR: Linux ARMv7 Mihomo asset was not found.", file=sys.stderr)
-              print("Available assets:", file=sys.stderr)
-              for asset in assets:
+              print("ERROR: Linux ARMv7 Mihomo asset not found.", file=sys.stderr)
+
+              for asset in data.get("assets", []):
                   print(asset.get("name", ""), file=sys.stderr)
+
               sys.exit(1)
 
           candidates.sort(key=lambda x: x[0])
@@ -119,34 +117,38 @@ jobs:
           print(candidates[-1][1])
           ')"
 
-          echo "===== Selected Mihomo URL ====="
+          echo "===== Selected Mihomo ====="
           echo "${MIHOMO_URL}"
 
           wget -O /tmp/mihomo.gz "${MIHOMO_URL}"
 
-          echo "===== Download ====="
+          echo "===== Mihomo archive ====="
           ls -lh /tmp/mihomo.gz
 
           gzip -dc /tmp/mihomo.gz > files/usr/local/bin/mihomo
 
           chmod 0755 files/usr/local/bin/mihomo
 
-          echo "===== Mihomo ELF information ====="
+          echo "===== Mihomo ELF ====="
           file files/usr/local/bin/mihomo
 
           readelf -h files/usr/local/bin/mihomo | \
             grep -E 'Class:|Data:|Machine:'
 
-      - name: Validate Mihomo architecture
+      - name: Validate Mihomo
         shell: bash
         run: |
           set -e
 
-          echo "Checking ELF architecture..."
+          echo "Checking Mihomo ELF..."
 
           file files/usr/local/bin/mihomo
 
-          MACHINE="$(readelf -h files/usr/local/bin/mihomo | awk -F: '/Machine:/ {gsub(/^[ \t]+/, "", $2); print $2}')"
+          MACHINE="$(readelf -h files/usr/local/bin/mihomo | \
+            awk -F: '/Machine:/ {
+              gsub(/^[ \t]+/, "", $2);
+              print $2
+            }')"
 
           echo "Detected machine: ${MACHINE}"
 
@@ -155,12 +157,12 @@ jobs:
               echo "Mihomo ARM binary detected."
               ;;
             *)
-              echo "ERROR: Mihomo binary is not ARM."
+              echo "ERROR: Mihomo is not an ARM binary."
               exit 1
               ;;
           esac
 
-      - name: Install TProxy LuCI files
+      - name: Install TProxy files
         shell: bash
         run: |
           set -e
@@ -173,92 +175,75 @@ jobs:
           echo "===== TProxy repository ====="
           find tproxy -maxdepth 3 -type f | sort
 
-          # OpenWrt package root files.
           if [ -d tproxy/root ]; then
             cp -a tproxy/root/. files/
           fi
 
-          # LuCI static files belong under /www/.
           if [ -d tproxy/htdocs ]; then
             mkdir -p files/www
             cp -a tproxy/htdocs/. files/www/
           fi
 
-          echo "===== Installed TProxy files ====="
+          echo "===== TProxy files ====="
           find files -type f | sort
 
-      - name: Create Mihomo default config
+      - name: Create Mihomo config
         shell: bash
         run: |
           set -e
 
-          printf '%s\n' \
-            'mixed-port: 7890' \
-            'tproxy-port: 12345' \
-            '' \
-            'allow-lan: true' \
-            'bind-address: "*"' \
-            '' \
-            'mode: rule' \
-            'log-level: warning' \
-            'ipv6: false' \
-            '' \
-            'dns:' \
-            '  enable: true' \
-            '  ipv6: false' \
-            '  listen: 0.0.0.0:1053' \
-            '' \
-            'proxies:' \
-            '  - name: DIRECT' \
-            '    type: direct' \
-            '' \
-            'proxy-groups:' \
-            '  - name: PROXY' \
-            '    type: select' \
-            '    proxies:' \
-            '      - DIRECT' \
-            '' \
-            'rules:' \
-            '  - MATCH,PROXY' \
-            > files/etc/clash.meta/config.yaml
+          cat > files/etc/clash.meta/config.yaml <<'EOF'
+          mixed-port: 7890
+          tproxy-port: 12345
+
+          allow-lan: true
+          bind-address: "*"
+
+          mode: rule
+          log-level: warning
+
+          ipv6: false
+
+          dns:
+            enable: true
+            ipv6: false
+            listen: 0.0.0.0:1053
+
+          proxies:
+            - name: DIRECT
+              type: direct
+
+          proxy-groups:
+            - name: PROXY
+              type: select
+              proxies:
+                - DIRECT
+
+          rules:
+            - MATCH,PROXY
+          EOF
 
           echo "===== Mihomo config ====="
           cat files/etc/clash.meta/config.yaml
 
-      - name: Enable ZRAM on first boot
+      - name: Enable ZRAM
         shell: bash
         run: |
           set -e
 
-          printf '%s\n' \
-            '#!/bin/sh' \
-            '' \
-            'if [ -x /etc/init.d/zram ]; then' \
-            '    /etc/init.d/zram enable' \
-            'fi' \
-            '' \
-            'exit 0' \
-            > files/etc/uci-defaults/99-zram-custom
+          cat > files/etc/uci-defaults/99-zram-custom <<'EOF'
+          #!/bin/sh
+
+          if [ -x /etc/init.d/zram ]; then
+              /etc/init.d/zram enable
+          fi
+
+          exit 0
+          EOF
 
           chmod 0755 files/etc/uci-defaults/99-zram-custom
 
-      - name: Show requested package set
-        shell: bash
-        run: |
-          set -e
-
-          echo "===== Additional packages ====="
-
-          printf '%s\n' \
-            'zram-swap' \
-            'kmod-zram' \
-            'kmod-nft-tproxy' \
-            'kmod-nft-socket' \
-            'ip-full' \
-            'nftables' \
-            'luci-base'
-
-      - name: Show ImageBuilder profile
+      - name: Show profile information
         shell: bash
         run: |
           set -e
@@ -280,11 +265,11 @@ jobs:
             FILES="../files" \
             V=s
 
-      - name: List firmware output
+      - name: List build output
         if: always()
         shell: bash
         run: |
-          echo "===== Generated files ====="
+          echo "===== Generated firmware ====="
 
           find imagebuilder/bin/targets \
             -type f \
@@ -295,7 +280,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          echo "===== File sizes ====="
+          echo "===== Firmware sizes ====="
 
           find imagebuilder/bin/targets \
             -type f \
@@ -303,7 +288,7 @@ jobs:
             2>/dev/null \
             | sort -n || true
 
-            - name: Upload firmware
+      - name: Upload firmware
         if: success()
         uses: actions/upload-artifact@v4
         with:
