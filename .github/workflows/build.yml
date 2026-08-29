@@ -1,0 +1,135 @@
+name: Build Redmi AX3000
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ci-ipq50xx-mainline-kernel-5.15-openwrt-23.05-20260509-161528-UTC
+  MIHOMO_VERSION: v1.19.30
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            git \
+            wget \
+            curl \
+            tar \
+            gzip \
+            xz-utils \
+            unzip \
+            file
+
+      - name: Download OpenWrt ImageBuilder
+        run: |
+          wget -O imagebuilder.tar.xz \
+            "https://github.com/Labradors/openwrt-redmi-ax3000/releases/download/${RELEASE_TAG}/openwrt-imagebuilder-ipq50xx-arm.Linux-x86_64.tar.xz"
+
+          mkdir imagebuilder
+          tar -xJf imagebuilder.tar.xz -C imagebuilder --strip-components=1
+
+      - name: Prepare custom files
+        run: |
+          mkdir -p files
+
+          # Download luci-app-tproxy source
+          git clone --depth 1 \
+            https://github.com/SmartRouterZone/luci-app-tproxy.git \
+            tproxy
+
+          # Install the LuCI/TProxy files directly into the firmware.
+          cp -a tproxy/root/. files/
+          cp -a tproxy/htdocs/. files/
+
+          # Mihomo ARMv7
+          mkdir -p files/usr/local/bin
+          wget -O mihomo.gz \
+            "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-armv7-${MIHOMO_VERSION}.gz"
+
+          echo "7b4e8793f9f8fa4a21ea66528890ebde5a73d557673fb94d3047eebb60ad7591  mihomo.gz" | sha256sum -c -
+
+          gzip -dc mihomo.gz > files/usr/local/bin/mihomo
+          chmod 755 files/usr/local/bin/mihomo
+
+          # Create the default Mihomo directory.
+          mkdir -p files/etc/clash.meta
+
+          # Safe initial configuration.
+          cat > files/etc/clash.meta/config.yaml <<'EOF'
+          mixed-port: 7890
+          tproxy-port: 12345
+          mode: rule
+          log-level: warning
+
+          allow-lan: true
+          bind-address: "*"
+
+          dns:
+            enable: true
+            ipv6: false
+            listen: 0.0.0.0:1053
+
+          proxies:
+            - name: DIRECT
+              type: direct
+
+          proxy-groups:
+            - name: PROXY
+              type: select
+              proxies:
+                - DIRECT
+
+          rules:
+            - MATCH,PROXY
+          EOF
+
+      - name: Configure ZRAM
+        run: |
+          mkdir -p files/etc/uci-defaults
+
+          cat > files/etc/uci-defaults/99-zram-custom <<'EOF'
+          #!/bin/sh
+
+          if [ -x /etc/init.d/zram ]; then
+              /etc/init.d/zram enable
+          fi
+
+          exit 0
+          EOF
+
+          chmod 755 files/etc/uci-defaults/99-zram-custom
+
+      - name: Build firmware
+        run: |
+          cd imagebuilder
+
+          make image \
+            PROFILE="redmi_ax3000" \
+            PACKAGES="zram-swap kmod-zram kmod-nft-tproxy kmod-nft-socket ip-full nftables luci-base" \
+            FILES="../files" \
+            V=s
+
+      - name: Find firmware
+        run: |
+          find imagebuilder/bin/targets/ipq50xx/arm -type f -maxdepth 2 -print
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: redmi-ax3000-custom-firmware
+          path: |
+            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*factory.ubi
+            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*initramfs*.itb
+            imagebuilder/bin/targets/ipq50xx/arm/*.manifest
