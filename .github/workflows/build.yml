@@ -303,11 +303,13 @@ jobs:
             2>/dev/null \
             | sort -n || true
 
-      - name: Upload firmware
+            - name: Upload firmware
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: redmi-ax3000-custom-firmware
           if-no-files-found: error
+          compression-level: 0
+          overwrite: true
           path: |
-            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*
+            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*squashfs-nand-factory.ubi
