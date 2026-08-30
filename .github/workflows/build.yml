@@ -15,8 +15,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install host tools
@@ -49,7 +48,10 @@ jobs:
             -C imagebuilder \
             --strip-components=1
 
-          echo "===== ImageBuilder repositories ====="
+          echo "===== ImageBuilder ====="
+          ls -lah imagebuilder
+
+          echo "===== Original repositories.conf ====="
           cat imagebuilder/repositories.conf
 
       - name: Fix repositories
@@ -61,12 +63,48 @@ jobs:
 
           sed -i '/immortalwrt_packages/d' repositories.conf
 
-          echo 'src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/packages-23.05/arm_cortex-a7_neon-vfpv4/base' >> repositories.conf
+          echo 'src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/23.05.3/packages/arm_cortex-a7_neon-vfpv4/base' >> repositories.conf
 
-          echo "===== repositories.conf after modification ====="
+          echo "===== Final repositories.conf ====="
           cat repositories.conf
 
-      - name: Prepare custom files
+      - name: Refresh package indexes
+        shell: bash
+        run: |
+          set -e
+
+          cd imagebuilder
+
+          make package_index V=s
+
+      - name: Check WiFi firmware packages
+        shell: bash
+        run: |
+          set -e
+
+          cd imagebuilder
+
+          echo "===== Searching firmware packages ====="
+
+          if grep -Rqs 'Package: ath11k-firmware-ipq5018$' .; then
+            echo "FOUND: ath11k-firmware-ipq5018"
+          else
+            echo "MISSING: ath11k-firmware-ipq5018"
+          fi
+
+          if grep -Rqs 'Package: ath11k-firmware-ipq5018-qcn6122$' .; then
+            echo "FOUND: ath11k-firmware-ipq5018-qcn6122"
+          else
+            echo "MISSING: ath11k-firmware-ipq5018-qcn6122"
+          fi
+
+          if grep -Rqs 'Package: ath11k-firmware-qcn6122$' .; then
+            echo "FOUND: ath11k-firmware-qcn6122"
+          else
+            echo "MISSING: ath11k-firmware-qcn6122"
+          fi
+
+      - name: Prepare filesystem
         shell: bash
         run: |
           set -e
@@ -75,54 +113,45 @@ jobs:
           mkdir -p files/etc/clash.meta
           mkdir -p files/etc/uci-defaults
 
-      - name: Download Mihomo
+      - name: Download Mihomo ARMv7
         shell: bash
         run: |
           set -e
 
           curl -fsSL \
             "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${MIHOMO_VERSION}" \
-            -o /tmp/mihomo.json
+            -o /tmp/mihomo-release.json
 
-          python3 - <<'PY'
+          MIHOMO_URL="$(python3 -c '
           import json
           import sys
 
-          with open("/tmp/mihomo.json", "r", encoding="utf-8") as f:
+          with open("/tmp/mihomo-release.json", "r", encoding="utf-8") as f:
               data = json.load(f)
 
-          found = []
+          candidates = []
 
           for asset in data.get("assets", []):
               name = asset.get("name", "")
               url = asset.get("browser_download_url", "")
 
-              name_l = name.lower()
+              n = name.lower()
 
-              if "linux-armv7" in name_l and name_l.endswith(".gz"):
-                  found.append((name, url))
+              if "linux-armv7" in n and n.endswith(".gz"):
+                  candidates.append((name, url))
 
-          if not found:
-              print("ERROR: Linux ARMv7 Mihomo asset not found.")
-              print("Available assets:")
-
+          if not candidates:
+              print("ERROR: linux-armv7 Mihomo asset not found", file=sys.stderr)
               for asset in data.get("assets", []):
-                  print(asset.get("name", ""))
-
+                  print(asset.get("name", ""), file=sys.stderr)
               sys.exit(1)
 
-          found.sort()
-          name, url = found[-1]
+          candidates.sort()
+          print(candidates[-1][1])
+          ')"
 
-          print("Selected asset:")
-          print(name)
-          print(url)
-
-          with open("/tmp/mihomo_url", "w", encoding="utf-8") as f:
-              f.write(url)
-          PY
-
-          MIHOMO_URL="$(cat /tmp/mihomo_url)"
+          echo "Selected Mihomo URL:"
+          echo "${MIHOMO_URL}"
 
           wget -O /tmp/mihomo.gz "${MIHOMO_URL}"
 
@@ -130,13 +159,44 @@ jobs:
 
           chmod 0755 files/usr/local/bin/mihomo
 
-          echo "===== Mihomo ====="
+          echo "===== Mihomo binary ====="
           file files/usr/local/bin/mihomo
 
           readelf -h files/usr/local/bin/mihomo | \
             grep -E 'Class:|Data:|Machine:'
 
-      - name: Create Mihomo config
+      - name: Verify Mihomo architecture
+        shell: bash
+        run: |
+          set -e
+
+          file files/usr/local/bin/mihomo
+
+          MACHINE="$(readelf -h files/usr/local/bin/mihomo | \
+            awk -F: '/Machine:/ {
+              gsub(/^[ \t]+/, "", $2);
+              print $2
+            }')"
+
+          echo "Detected machine: ${MACHINE}"
+
+          case "${MACHINE}" in
+            ARM*)
+              echo "OK: ARM Mihomo binary"
+              ;;
+            *)
+              echo "ERROR: Wrong Mihomo architecture"
+              exit 1
+              ;;
+          esac
+
+      - name: Create Mihomo directory
+        shell: bash
+        run: |
+          set -e
+          mkdir -p files/etc/clash.meta
+
+      - name: Create minimal Mihomo config
         shell: bash
         run: |
           set -e
@@ -144,10 +204,8 @@ jobs:
           printf '%s\n' \
             'mixed-port: 7890' \
             'tproxy-port: 12345' \
-            '' \
             'allow-lan: true' \
             'bind-address: "*"' \
-            '' \
             'mode: rule' \
             'log-level: warning' \
             'ipv6: false' \
@@ -171,31 +229,6 @@ jobs:
             '  - MATCH,PROXY' \
             > files/etc/clash.meta/config.yaml
 
-          echo "===== Mihomo config ====="
-          cat files/etc/clash.meta/config.yaml
-
-      - name: Install TProxy files
-        shell: bash
-        run: |
-          set -e
-
-          git clone \
-            --depth 1 \
-            https://github.com/SmartRouterZone/luci-app-tproxy.git \
-            tproxy
-
-          if [ -d tproxy/root ]; then
-            cp -a tproxy/root/. files/
-          fi
-
-          if [ -d tproxy/htdocs ]; then
-            mkdir -p files/www
-            cp -a tproxy/htdocs/. files/www/
-          fi
-
-          echo "===== TProxy files ====="
-          find files -type f | sort
-
       - name: Enable ZRAM
         shell: bash
         run: |
@@ -213,29 +246,15 @@ jobs:
 
           chmod 0755 files/etc/uci-defaults/99-zram-custom
 
-      - name: Show profile
+      - name: Get device package list
         shell: bash
         run: |
           set -e
+
           cd imagebuilder
+
+          echo "===== PROFILE INFO ====="
           make info V=s
-
-      - name: Check firmware package names
-        shell: bash
-        run: |
-          set -e
-
-          cd imagebuilder
-
-          echo "===== Checking ath11k packages ====="
-
-          if grep -Rqs "Package: ath11k-firmware-ipq5018-qcn6122" packages; then
-            echo "Combined IPQ5018/QCN6122 firmware package found."
-          else
-            echo "Combined firmware package was not found in local indexes."
-            echo "Available ath11k package entries:"
-            grep -Rhs "Package: ath11k-firmware" packages 2>/dev/null | sort -u || true
-          fi
 
       - name: Build firmware
         shell: bash
@@ -246,11 +265,11 @@ jobs:
 
           make image \
             PROFILE="redmi_ax3000" \
-            PACKAGES="-ath11k-firmware-ipq5018 -ath11k-firmware-qcn6122 ath11k-firmware-ipq5018-qcn6122 zram-swap kmod-zram kmod-nft-tproxy kmod-nft-socket ip-full nftables luci-base" \
+            PACKAGES="-ath11k-firmware-ipq5018 -ath11k-firmware-qcn6122 ath11k-firmware-ipq5018 ath11k-firmware-ipq5018-qcn6122 zram-swap kmod-zram kmod-nft-tproxy kmod-nft-socket ip-full nftables luci-base" \
             FILES="../files" \
             V=s
 
-      - name: List generated files
+      - name: List firmware
         if: always()
         shell: bash
         run: |
@@ -261,35 +280,17 @@ jobs:
             -print \
             2>/dev/null | sort || true
 
-      - name: Generate manifest
-        if: always()
-        shell: bash
-        run: |
-          set -e
-
-          find imagebuilder/bin/targets \
-            -type f \
-            -name "*.manifest" \
-            -exec cat {} \; \
-            > firmware-manifest.txt 2>/dev/null || true
-
-          echo "===== Firmware manifest ====="
-          cat firmware-manifest.txt 2>/dev/null || true
-
       - name: Calculate SHA256
-        if: always()
+        if: success()
         shell: bash
         run: |
           set -e
 
-          find imagebuilder/bin/targets \
+          find imagebuilder/bin/targets/ipq50xx/arm \
             -type f \
-            -name "*redmi_ax3000*" \
+            -name '*redmi_ax3000*' \
             -exec sha256sum {} \; \
-            > firmware-sha256.txt 2>/dev/null || true
-
-          echo "===== SHA256 ====="
-          cat firmware-sha256.txt 2>/dev/null || true
+            2>/dev/null || true
 
       - name: Upload firmware
         if: success()
@@ -301,5 +302,3 @@ jobs:
           overwrite: true
           path: |
             imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*squashfs-nand-factory.ubi
-            firmware-manifest.txt
-            firmware-sha256.txt
