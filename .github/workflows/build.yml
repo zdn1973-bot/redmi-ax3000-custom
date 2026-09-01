@@ -33,7 +33,8 @@ jobs:
             git \
             file \
             binutils \
-            python3
+            python3 \
+            squashfs-tools
 
       - name: Download ImageBuilder
         shell: bash
@@ -49,24 +50,21 @@ jobs:
             -C imagebuilder \
             --strip-components=1
 
-          echo "===== ImageBuilder ====="
-          ls -lah imagebuilder
-
-          echo "===== repositories.conf ====="
+          echo "===== repositories.conf BEFORE ====="
           cat imagebuilder/repositories.conf
 
-      - name: Fix package feed
+      - name: Fix repositories
         shell: bash
         run: |
           set -e
 
           cd imagebuilder
 
-          sed -i '/immortalwrt_packages/d' repositories.conf
+          sed -i '/^[[:space:]]*src\/gz[[:space:]]\+immortalwrt_packages[[:space:]]/d' repositories.conf
 
           echo 'src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/23.05.3/packages/arm_cortex-a7_neon-vfpv4/base' >> repositories.conf
 
-          echo "===== repositories.conf after fix ====="
+          echo "===== repositories.conf AFTER ====="
           cat repositories.conf
 
       - name: Prepare filesystem
@@ -78,7 +76,7 @@ jobs:
           mkdir -p files/etc/clash.meta
           mkdir -p files/etc/uci-defaults
 
-      - name: Download Mihomo ARMv7
+      - name: Download Mihomo Linux ARMv7
         shell: bash
         run: |
           set -e
@@ -94,28 +92,24 @@ jobs:
           with open("/tmp/mihomo-release.json", "r", encoding="utf-8") as f:
               data = json.load(f)
 
-          matches = []
+          candidates = []
 
           for asset in data.get("assets", []):
               name = asset.get("name", "")
               url = asset.get("browser_download_url", "")
 
               if "linux-armv7" in name.lower() and name.lower().endswith(".gz"):
-                  matches.append((name, url))
+                  candidates.append((name, url))
 
-          if not matches:
-              print("ERROR: Linux ARMv7 Mihomo asset was not found.", file=sys.stderr)
-
-              for asset in data.get("assets", []):
-                  print(asset.get("name", ""), file=sys.stderr)
-
+          if not candidates:
+              print("ERROR: Linux ARMv7 Mihomo asset not found.", file=sys.stderr)
               sys.exit(1)
 
-          matches.sort()
-          print(matches[-1][1])
+          candidates.sort(key=lambda x: x[0])
+          print(candidates[-1][1])
           ')"
 
-          echo "Selected Mihomo:"
+          echo "===== Selected Mihomo ====="
           echo "${MIHOMO_URL}"
 
           wget -O /tmp/mihomo.gz "${MIHOMO_URL}"
@@ -123,13 +117,56 @@ jobs:
           gzip -dc /tmp/mihomo.gz > files/usr/local/bin/mihomo
           chmod 0755 files/usr/local/bin/mihomo
 
-          echo "===== Mihomo ====="
           file files/usr/local/bin/mihomo
-
           readelf -h files/usr/local/bin/mihomo | \
             grep -E 'Class:|Data:|Machine:'
 
-      - name: Create Mihomo config
+      - name: Validate Mihomo
+        shell: bash
+        run: |
+          set -e
+
+          MACHINE="$(readelf -h files/usr/local/bin/mihomo | \
+            awk -F: '/Machine:/ {
+              gsub(/^[ \t]+/, "", $2);
+              print $2
+            }')"
+
+          echo "Detected architecture: ${MACHINE}"
+
+          case "${MACHINE}" in
+            ARM*)
+              echo "Mihomo ARM binary confirmed."
+              ;;
+            *)
+              echo "ERROR: Mihomo is not ARM."
+              exit 1
+              ;;
+          esac
+
+      - name: Install TProxy files
+        shell: bash
+        run: |
+          set -e
+
+          git clone \
+            --depth 1 \
+            https://github.com/SmartRouterZone/luci-app-tproxy.git \
+            tproxy
+
+          if [ -d tproxy/root ]; then
+            cp -a tproxy/root/. files/
+          fi
+
+          if [ -d tproxy/htdocs ]; then
+            mkdir -p files/www
+            cp -a tproxy/htdocs/. files/www/
+          fi
+
+          echo "===== Custom files ====="
+          find files -type f | sort
+
+      - name: Create minimal Mihomo configuration
         shell: bash
         run: |
           set -e
@@ -137,13 +174,10 @@ jobs:
           cat > files/etc/clash.meta/config.yaml <<'EOF'
           mixed-port: 7890
           tproxy-port: 12345
-
           allow-lan: true
           bind-address: "*"
-
           mode: rule
           log-level: warning
-
           ipv6: false
 
           dns:
@@ -182,29 +216,7 @@ jobs:
 
           chmod 0755 files/etc/uci-defaults/99-zram-custom
 
-      - name: Install TProxy files
-        shell: bash
-        run: |
-          set -e
-
-          git clone \
-            --depth 1 \
-            https://github.com/SmartRouterZone/luci-app-tproxy.git \
-            tproxy
-
-          if [ -d tproxy/root ]; then
-              cp -a tproxy/root/. files/
-          fi
-
-          if [ -d tproxy/htdocs ]; then
-              mkdir -p files/www
-              cp -a tproxy/htdocs/. files/www/
-          fi
-
-          echo "===== Files to embed ====="
-          find files -type f -print | sort
-
-      - name: Show ImageBuilder profile
+      - name: Verify ImageBuilder profile
         shell: bash
         run: |
           set -e
@@ -225,48 +237,83 @@ jobs:
             FILES="../files" \
             V=s
 
-      - name: Generate build manifest copy
-        if: always()
-        shell: bash
-        run: |
-          set +e
-
-          echo "===== Target files ====="
-
-          find imagebuilder/bin/targets \
-            -maxdepth 4 \
-            -type f \
-            -print \
-            2>/dev/null | sort
-
-          echo "===== ImageBuilder package files ====="
-
-          find imagebuilder/packages \
-            -maxdepth 2 \
-            -type f \
-            -print \
-            2>/dev/null | sort
-
-          echo "===== Available target manifests ====="
-
-          find imagebuilder/bin/targets \
-            -type f \
-            -name "*.manifest" \
-            -exec sh -c 'echo "----- $1 -----"; cat "$1"' _ {} \; \
-            2>/dev/null || true
-
-      - name: Calculate firmware SHA256
-        if: success()
+      - name: Verify generated firmware
         shell: bash
         run: |
           set -e
 
-          find imagebuilder/bin/targets/ipq50xx/arm \
+          echo "===== Generated files ====="
+
+          find imagebuilder/bin/targets \
             -type f \
-            -name "*redmi_ax3000*.ubi" \
+            -print \
+            2>/dev/null | sort
+
+          echo "===== UBI files ====="
+
+          UBI_COUNT="$(find imagebuilder/bin/targets \
+            -type f \
+            -name '*redmi_ax3000*squashfs-nand-factory.ubi' \
+            | wc -l)"
+
+          echo "UBI count: ${UBI_COUNT}"
+
+          if [ "${UBI_COUNT}" -ne 1 ]; then
+              echo "ERROR: Expected exactly one Redmi AX3000 factory UBI."
+              exit 1
+          fi
+
+      - name: Extract manifest
+        shell: bash
+        run: |
+          set -e
+
+          MANIFEST="$(find imagebuilder/bin/targets \
+            -type f \
+            -name '*redmi_ax3000*.manifest' \
+            | head -1)"
+
+          if [ -n "${MANIFEST}" ]; then
+              echo "===== Manifest ====="
+              cat "${MANIFEST}"
+          else
+              echo "ERROR: Manifest not found."
+              exit 1
+          fi
+
+      - name: Check important packages
+        shell: bash
+        run: |
+          set -e
+
+          MANIFEST="$(find imagebuilder/bin/targets \
+            -type f \
+            -name '*redmi_ax3000*.manifest' \
+            | head -1)"
+
+          echo "Checking manifest..."
+
+          grep -E \
+            '(^|[[:space:]])(zram-swap|kmod-zram|kmod-nft-tproxy|kmod-nft-socket|ip-full)([[:space:]]|$)' \
+            "${MANIFEST}" || true
+
+          echo "===== Firmware Wi-Fi packages ====="
+
+          grep -E \
+            'ath11k|ipq-wifi-redmi_ax3000' \
+            "${MANIFEST}" || true
+
+      - name: Show firmware hashes
+        shell: bash
+        run: |
+          set -e
+
+          find imagebuilder/bin/targets \
+            -type f \
+            -name '*redmi_ax3000*squashfs-nand-factory.ubi' \
             -exec sha256sum {} \;
 
-      - name: Upload firmware and manifest
+      - name: Upload firmware
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -275,5 +322,5 @@ jobs:
           compression-level: 0
           overwrite: true
           path: |
-            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*.ubi
-            imagebuilder/bin/targets/ipq50xx/arm/*.manifest
+            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*squashfs-nand-factory.ubi
+            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*.manifest
