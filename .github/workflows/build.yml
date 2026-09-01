@@ -15,190 +15,147 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install host tools
-        shell: bash
         run: |
-          set -e
           sudo apt-get update
-          sudo apt-get install -y \
-            wget \
-            curl \
-            tar \
-            xz-utils \
-            gzip \
-            git \
-            file \
-            binutils \
-            python3
+          sudo apt-get install -y wget curl tar xz-utils gzip git file binutils python3
 
       - name: Download ImageBuilder
-        shell: bash
         run: |
           set -e
 
           wget -O imagebuilder.tar.xz \
             "https://github.com/Labradors/openwrt-redmi-ax3000/releases/download/${RELEASE_TAG}/openwrt-imagebuilder-ipq50xx-arm.Linux-x86_64.tar.xz"
 
-          rm -rf imagebuilder
           mkdir -p imagebuilder
 
           tar -xJf imagebuilder.tar.xz \
             -C imagebuilder \
             --strip-components=1
 
-          echo "===== ImageBuilder ready ====="
+          echo "===== ImageBuilder loaded ====="
           ls -lah imagebuilder
 
       - name: Fix ImageBuilder repositories
-        shell: bash
         run: |
           set -e
 
           cd imagebuilder
 
-          echo "===== Original repositories ====="
-          cat repositories.conf
-
           sed -i '/immortalwrt_packages/d' repositories.conf
 
-          cat >> repositories.conf <<'EOF'
-src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/23.05.3/packages/arm_cortex-a7_neon-vfpv4/base
-EOF
+          echo "src/gz immortalwrt_packages https://downloads.immortalwrt.org/releases/23.05.3/packages/arm_cortex-a7_neon-vfpv4/base" >> repositories.conf
 
-          echo "===== Final repositories ====="
+          echo "===== repositories.conf ====="
           cat repositories.conf
 
       - name: Prepare custom files
-        shell: bash
         run: |
           set -e
 
-          rm -rf files
           mkdir -p files/usr/local/bin
           mkdir -p files/etc/clash.meta
           mkdir -p files/etc/uci-defaults
 
-      - name: Download Mihomo Linux ARMv7
-        shell: bash
+      - name: Download Mihomo ARMv7
         run: |
           set -e
 
           curl -fsSL \
             "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${MIHOMO_VERSION}" \
-            -o /tmp/mihomo-release.json
+            -o /tmp/mihomo.json
 
-          MIHOMO_URL="$(python3 -c '
+          MIHOMO_URL=$(python3 -c "
           import json
-          import sys
 
-          with open("/tmp/mihomo-release.json", "r", encoding="utf-8") as f:
+          with open('/tmp/mihomo.json', 'r') as f:
               data = json.load(f)
 
-          matches = []
+          found = []
 
-          for asset in data.get("assets", []):
-              name = asset.get("name", "")
-              url = asset.get("browser_download_url", "")
+          for asset in data.get('assets', []):
+              name = asset.get('name', '').lower()
+              url = asset.get('browser_download_url', '')
 
-              if name.lower().startswith("mihomo-linux-armv7-") and name.lower().endswith(".gz"):
-                  matches.append((name, url))
+              if 'linux-armv7' in name and name.endswith('.gz'):
+                  found.append((name, url))
 
-          if not matches:
-              print("No Linux ARMv7 Mihomo asset found.", file=sys.stderr)
+          if not found:
+              raise SystemExit('Linux ARMv7 Mihomo asset not found')
 
-              for asset in data.get("assets", []):
-                  print(asset.get("name", ""), file=sys.stderr)
+          found.sort()
+          print(found[-1][1])
+          ")
 
-              sys.exit(1)
+          echo "===== Mihomo URL ====="
+          echo "$MIHOMO_URL"
 
-          matches.sort(key=lambda x: x[0])
-
-          print(matches[-1][1])
-          ')"
-
-          echo "Selected asset:"
-          echo "${MIHOMO_URL}"
-
-          wget -O /tmp/mihomo.gz "${MIHOMO_URL}"
-
-          test -s /tmp/mihomo.gz
+          wget -O /tmp/mihomo.gz "$MIHOMO_URL"
 
           gzip -dc /tmp/mihomo.gz > files/usr/local/bin/mihomo
 
           chmod 0755 files/usr/local/bin/mihomo
 
-          echo "===== Mihomo binary ====="
+          echo "===== Mihomo information ====="
           file files/usr/local/bin/mihomo
-          ls -lh files/usr/local/bin/mihomo
-
-          readelf -h files/usr/local/bin/mihomo | \
-            grep -E 'Class:|Data:|Machine:'
+          readelf -h files/usr/local/bin/mihomo | grep Machine
 
       - name: Create Mihomo configuration
-        shell: bash
         run: |
           set -e
 
-          cat > files/etc/clash.meta/config.yaml <<'EOF'
-mixed-port: 7890
-tproxy-port: 12345
-allow-lan: true
-bind-address: "*"
-mode: rule
-log-level: warning
-ipv6: false
-
-dns:
-  enable: true
-  ipv6: false
-  listen: 0.0.0.0:1053
-
-proxies:
-  - name: DIRECT
-    type: direct
-
-proxy-groups:
-  - name: PROXY
-    type: select
-    proxies:
-      - DIRECT
-
-rules:
-  - MATCH,PROXY
-EOF
-
-          echo "===== Mihomo config ====="
-          cat files/etc/clash.meta/config.yaml
+          printf '%s\n' \
+            'mixed-port: 7890' \
+            'tproxy-port: 12345' \
+            'allow-lan: true' \
+            'bind-address: "*"' \
+            'mode: rule' \
+            'log-level: warning' \
+            'ipv6: false' \
+            'dns:' \
+            '  enable: true' \
+            '  ipv6: false' \
+            '  listen: 0.0.0.0:1053' \
+            'proxies:' \
+            '  - name: DIRECT' \
+            '    type: direct' \
+            'proxy-groups:' \
+            '  - name: PROXY' \
+            '    type: select' \
+            '    proxies:' \
+            '      - DIRECT' \
+            'rules:' \
+            '  - MATCH,PROXY' \
+            > files/etc/clash.meta/config.yaml
 
       - name: Enable ZRAM
-        shell: bash
         run: |
           set -e
 
-          cat > files/etc/uci-defaults/99-zram-custom <<'EOF'
-#!/bin/sh
-
-[ -x /etc/init.d/zram ] && /etc/init.d/zram enable
-
-exit 0
-EOF
+          printf '%s\n' \
+            '#!/bin/sh' \
+            '' \
+            'if [ -x /etc/init.d/zram ]; then' \
+            '    /etc/init.d/zram enable' \
+            'fi' \
+            '' \
+            'exit 0' \
+            > files/etc/uci-defaults/99-zram-custom
 
           chmod 0755 files/etc/uci-defaults/99-zram-custom
 
       - name: Install TProxy files
-        shell: bash
         run: |
           set -e
 
-          git clone --depth 1 \
+          git clone \
+            --depth 1 \
             https://github.com/SmartRouterZone/luci-app-tproxy.git \
             tproxy
-
-          echo "===== TProxy tree ====="
-          find tproxy -maxdepth 3 -type f | sort
 
           if [ -d tproxy/root ]; then
             cp -a tproxy/root/. files/
@@ -209,18 +166,18 @@ EOF
             cp -a tproxy/htdocs/. files/www/
           fi
 
-          echo "===== Files to embed ====="
+          echo "===== TProxy files ====="
           find files -type f | sort
 
-      - name: Show firmware profile
-        shell: bash
+      - name: Show profile
         run: |
           set -e
+
           cd imagebuilder
+
           make info V=s
 
       - name: Build firmware
-        shell: bash
         run: |
           set -e
 
@@ -232,11 +189,10 @@ EOF
             FILES="../files" \
             V=s
 
-      - name: Verify generated files
+      - name: Verify build output
         if: always()
-        shell: bash
         run: |
-          echo "===== Generated files ====="
+          echo "===== BUILD OUTPUT ====="
 
           find imagebuilder/bin/targets \
             -type f \
@@ -245,31 +201,18 @@ EOF
 
       - name: Create manifest
         if: success()
-        shell: bash
         run: |
           set -e
 
-          OUT="imagebuilder/bin/targets/ipq50xx/arm"
-
-          echo "Firmware files:" > "${OUT}/custom-build-info.txt"
-          find "${OUT}" \
-            -maxdepth 1 \
+          find imagebuilder/bin/targets \
             -type f \
-            -name '*redmi_ax3000*' \
-            -printf '%f\n' \
-            | sort >> "${OUT}/custom-build-info.txt"
+            -printf '%p\n' \
+            2>/dev/null | sort \
+            > firmware-files.txt
 
-          echo "" >> "${OUT}/custom-build-info.txt"
-          echo "SHA256:" >> "${OUT}/custom-build-info.txt"
-
-          find "${OUT}" \
-            -maxdepth 1 \
-            -type f \
-            -name '*redmi_ax3000*' \
-            -exec sha256sum {} \; \
-            >> "${OUT}/custom-build-info.txt"
-
-          cat "${OUT}/custom-build-info.txt"
+          sha256sum \
+            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*.ubi \
+            > firmware-sha256.txt
 
       - name: Upload firmware
         if: success()
@@ -280,5 +223,6 @@ EOF
           compression-level: 0
           overwrite: true
           path: |
-            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*squashfs-nand-factory.ubi
-            imagebuilder/bin/targets/ipq50xx/arm/custom-build-info.txt
+            imagebuilder/bin/targets/ipq50xx/arm/*redmi_ax3000*.ubi
+            firmware-files.txt
+            firmware-sha256.txt
